@@ -1,0 +1,4 @@
+src/*.o
+results
+.clangd
+memoryam.dylib

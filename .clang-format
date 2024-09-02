@@ -1,0 +1,10 @@
+---
+Cpp11BracedListStyle: 'false'
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: 'true'
+SpacesInSquareBrackets: 'true'
+UseTab: Never
+AlignConsecutiveAssignments: 'true'
+
+
+...

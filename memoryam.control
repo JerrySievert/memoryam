@@ -1,0 +1,4 @@
+comment = 'Memory AM - In memory unlogged tables'
+default_version = '0.0.1'
+module_pathname = '$libdir/memoryam'
+relocatable = false
