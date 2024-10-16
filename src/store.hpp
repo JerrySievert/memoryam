@@ -19,7 +19,6 @@ extern "C" {
 struct MemoryScanDesc {
   TableScanDescData rs_base;
   size_t cursor;
-  bool in_local_changes;
   std::vector<AttrNumber> needed_columns;
 };
 
@@ -54,7 +53,6 @@ struct TransactionInsert {
   TransactionId xmin;
   TransactionId xmax;
   SubTransactionId subxact;
-  Columns columns;
 };
 
 struct TransactionDelete {
@@ -64,7 +62,7 @@ struct TransactionDelete {
   bool in_local_changes;
 };
 
-typedef std::vector<TransactionInsert> TransactionInsertList;
+typedef std::vector<size_t> TransactionInsertList;
 typedef std::vector<size_t> TransactionDeleteList;
 
 struct Table {
@@ -89,6 +87,8 @@ struct Table {
   bool read_row(ItemPointerData item_pointer, TransactionId xact,
                 TupleTableSlot *slot, std::vector<AttrNumber> needed_columns);
 
+  void debug_row(size_t);
+
 private:
   void copy_columns_to_slot(Columns columns, TupleTableSlot *slot,
                             std::vector<AttrNumber> attributes);
@@ -109,6 +109,5 @@ struct Database {
 
 extern Database database;
 
-extern ItemPointerData row_number_to_item_pointer(size_t row_number,
-                                                  OffsetNumber offset);
+extern ItemPointerData row_number_to_item_pointer(size_t row_number);
 extern size_t item_pointer_to_row_number(ItemPointerData item_pointer);

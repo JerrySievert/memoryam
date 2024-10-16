@@ -19,13 +19,12 @@ extern "C" {
 #include "memoryam.hpp"
 #include "store.hpp"
 
-ItemPointerData row_number_to_item_pointer(size_t row_number,
-                                           OffsetNumber offset) {
+ItemPointerData row_number_to_item_pointer(size_t row_number) {
   ItemPointerData item_pointer = { { 0, 0 } };
 
   BlockNumber block_number = (BlockNumber)(row_number);
   ItemPointerSetBlockNumber(&item_pointer, block_number);
-  ItemPointerSetOffsetNumber(&item_pointer, offset);
+  ItemPointerSetOffsetNumber(&item_pointer, 0);
 
   return item_pointer;
 }
@@ -94,12 +93,6 @@ ItemPointerData Table::insert_row(Relation relation, Datum *values,
 
   MemoryContext original_context =
       MemoryContextSwitchTo(database.memory_context);
-
-  TransactionInsert transaction_insert = { .xmin = GetCurrentTransactionId( ),
-                                           .xmax = 0,
-                                           .subxact =
-                                               GetCurrentSubTransactionId( ) };
-
   std::vector<Column *> row;
 
   for (size_t i = 0; i < column_definitions.size( ); i++) {
@@ -127,9 +120,17 @@ ItemPointerData Table::insert_row(Relation relation, Datum *values,
       }
     }
 
-    transaction_insert.columns.push_back(column);
+    /* Push back every column for this row. */
+    rows[ i ].push_back(column);
   }
 
+  /* Write the metadata, to be dealt with at the end of the transaction. */
+  RowMetadata metadata = { .xmin = GetCurrentTransactionId( ),
+                           .xmax = GetCurrentTransactionId( ) };
+
+  row_metadata.push_back(metadata);
+
+  /* Get or create the transaction insert list for this transaction. */
   TransactionInsertList list;
   try {
     list = transaction_inserts[ GetCurrentTransactionId( ) ];
@@ -137,55 +138,37 @@ ItemPointerData Table::insert_row(Relation relation, Datum *values,
     list = TransactionInsertList( );
   }
 
-  list.push_back(transaction_insert);
+  list.push_back(row_metadata.size( ) - 1);
+
   transaction_inserts[ GetCurrentTransactionId( ) ] = list;
 
   ItemPointerData item_pointer =
-      row_number_to_item_pointer(list.size( ) - 1, 1 << 15);
+      row_number_to_item_pointer(row_metadata.size( ) - 1);
 
-  size_t row_number           = item_pointer_to_row_number(item_pointer);
-  bool in_transaction_changes = (item_pointer.ip_posid & (1 << 15));
-  elog(NOTICE,
-       "insert_row() -> row_number %ld (%ld), in_transaction_changes: %s",
-       row_number, list.size( ) - 1, in_transaction_changes ? "true" : "false");
+  size_t row_number = item_pointer_to_row_number(item_pointer);
+
   MemoryContextSwitchTo(original_context);
-
+  // debug_row(row_number);
   return item_pointer;
 }
 
 TM_Result Table::delete_row(Relation relation, ItemPointerData item_pointer) {
-  bool in_transaction_changes = (item_pointer.ip_posid & (1 << 15));
-
   size_t row_number = item_pointer_to_row_number(item_pointer);
 
-  if (in_transaction_changes) {
-    if (row_number >
-        transaction_inserts[ GetCurrentTransactionId( ) ].size( )) {
-      ereport(
-          ERROR, errcode(ERRCODE_INTERNAL_ERROR),
-          errmsg("row %ld is outside of transaction changes (%ld)", row_number,
-                 transaction_inserts[ GetCurrentTransactionId( ) ].size( )));
-    }
-
-    if (transaction_inserts[ GetCurrentTransactionId( ) ][ row_number ].xmax !=
-            0 &&
-        transaction_inserts[ GetCurrentTransactionId( ) ][ row_number ].xmax <=
-            GetCurrentTransactionId( )) {
-      return TM_Deleted;
-    }
-
-    /* Otherwise, mark the existing row with a maximum transaction. */
-    transaction_inserts[ GetCurrentTransactionId( ) ][ row_number ].xmax =
-        GetCurrentTransactionId( );
-  } else {
-    if (row_number > row_metadata.size( )) {
-      ereport(ERROR, errcode(ERRCODE_INTERNAL_ERROR),
-              errmsg("row %ld is outside of storage (%ld)", row_number,
-                     row_metadata.size( )));
-    }
-
-    transaction_deletes[ GetCurrentTransactionId( ) ].push_back(row_number);
+  if (row_number > row_metadata.size( )) {
+    ereport(ERROR, errcode(ERRCODE_INTERNAL_ERROR),
+            errmsg("row %ld is outside of storage (%ld)", row_number,
+                   row_metadata.size( )));
   }
+
+  if ((row_metadata[ row_number ].xmax != 0 &&
+       row_metadata[ row_number ].xmax <= GetCurrentTransactionId( )) ||
+      row_deleted_in_transaction(row_number, GetCurrentTransactionId( ))) {
+    return TM_Deleted;
+  }
+
+  /* Otherwise, mark the row deleted in this transaction. */
+  transaction_deletes[ GetCurrentTransactionId( ) ].push_back(row_number);
 
   return TM_Ok;
 }
@@ -211,163 +194,121 @@ bool Table::row_deleted_in_transaction(size_t row_number, TransactionId xact) {
 
 bool Table::row_visible_in_snapshot(ItemPointerData item_pointer,
                                     Snapshot snapshot) {
+  DEBUG( );
   bool in_transaction_changes = (item_pointer.ip_posid & (1 << 15));
 
   size_t row_number = item_pointer_to_row_number(item_pointer);
 
   bool visible = false;
 
-  if (in_transaction_changes) {
-    elog(NOTICE, "row_version in_transaction_changes");
-    TransactionInsertList list;
-
-    TransactionId xact = snapshot->xmax;
-    if (xact == 0) {
-      xact = GetCurrentTransactionId( );
-    }
-    try {
-      list = transaction_inserts[ xact ];
-    } catch (std::out_of_range) {
-      elog(NOTICE, "No inserts in current transaction");
-      return false;
-    }
-
-    elog(NOTICE, "row_number %ld, list.size %ld", row_number, list.size( ));
-    if (row_number >= list.size( )) {
-      ereport(ERROR, errcode(ERRCODE_INTERNAL_ERROR),
-              errmsg("Row %ld is outside the range for transaction (%d) - "
-                     "in_transaction_changes",
-                     row_number, xact));
-    }
-
-    TransactionInsert row = list[ row_number ];
-    elog(NOTICE, "xmin %d/%d, xmax %d/%d", snapshot->xmin, row.xmin,
-         snapshot->xmax, row.xmax);
-
-    visible = (snapshot->xmin == 0 || row.xmin <= snapshot->xmin) &&
-              (row.xmax == 0 || row.xmax > snapshot->xmax);
-    // visible = row.xmin <= snapshot->xmin &&
-    //           (row.xmax == 0 || row.xmax > snapshot->xmax);
-  } else {
-    if (row_number >= row_metadata.size( )) {
-      ereport(
-          ERROR, errcode(ERRCODE_INTERNAL_ERROR),
-          errmsg("Row %ld is outside the range for transaction", row_number));
-    }
-
-    RowMetadata row = row_metadata[ row_number ];
-    elog(NOTICE, "xmin %d/%d, xmax %d/%d", snapshot->xmin, row.xmin,
-         snapshot->xmax, row.xmax);
-    visible = (snapshot->xmin == 0 || row.xmin <= snapshot->xmin) &&
-              (row.xmax == 0 || row.xmax > snapshot->xmax);
+  if (row_number >= row_metadata.size( )) {
+    ereport(ERROR, errcode(ERRCODE_INTERNAL_ERROR),
+            errmsg("Row %ld is outside the range for transaction", row_number));
   }
-  elog(NOTICE, "returning visible: %s", visible ? "true" : "false");
+
+  RowMetadata row = row_metadata[ row_number ];
+
+  visible = (snapshot->xmin == 0 || row.xmin <= snapshot->xmin) &&
+            (row.xmax == 0 || row.xmax >= snapshot->xmax);
+
+  try {
+    TransactionDeleteList list =
+        transaction_deletes[ GetCurrentTransactionId( ) ];
+
+    for (size_t i = 0; i < list.size( ); i++) {
+      if (list[ i ] == row_number) {
+        visible = false;
+        break;
+      }
+    }
+  } catch (std::out_of_range) {
+    // nothing to do here, can be ignored.
+  }
+
   return visible;
+}
+
+char *datum_to_string(Datum value) {
+  char *str = (char *)palloc(VARSIZE_ANY_EXHDR(value) + 1);
+  memcpy(str, (char *)VARDATA(value), VARSIZE_ANY_EXHDR(value));
+  str[ VARSIZE_ANY_EXHDR(value) ] = '\0';
+
+  return str;
+}
+
+void Table::debug_row(size_t row_number) {
+  std::string output = "---------------------------------------------------\n";
+  output += "row_mumber: " + std::to_string(row_number) + "\n";
+  output +=
+      "xmin:       " + std::to_string(row_metadata[ row_number ].xmin) + "\n";
+  output +=
+      "xmax:       " + std::to_string(row_metadata[ row_number ].xmax) + "\n";
+  output += "columns:\n";
+  output += "  1 => " + std::to_string(rows[ 0 ][ row_number ]->value) + "\n";
+  output += "  2 => " +
+            std::string(datum_to_string(rows[ 1 ][ row_number ]->value)) + "\n";
+  output += "---------------------------------------------------\n";
+  elog(NOTICE, "%s", output.c_str( ));
 }
 
 bool Table::read_row(ItemPointerData item_pointer, TransactionId xact,
                      TupleTableSlot *slot,
                      std::vector<AttrNumber> needed_columns) {
   /* If we are here, then we've already decided that the row is viable. */
+  DEBUG( );
   bool in_transaction_changes = (item_pointer.ip_posid & (1 << 15));
 
   if (xact == 0) {
-    elog(NOTICE, "returning false");
-    return false;
     xact = GetCurrentTransactionId( );
+  }
+
+  if (!row_visible_in_snapshot(item_pointer, GetActiveSnapshot( ))) {
+    return false;
   }
 
   size_t row_number = item_pointer_to_row_number(item_pointer);
 
   Columns columns;
-  elog(NOTICE, "read_row %ld (%s) transactionid %d", row_number,
-       in_transaction_changes ? "true" : "false", xact);
-  in_transaction_changes = false;
-  if (in_transaction_changes) {
-    try {
-      columns = transaction_inserts[ xact ][ row_number ].columns;
-      char *t = VARDATA_ANY(columns[ 1 ]->value);
-      elog(NOTICE, "column 1: %s", t);
-    } catch (std::out_of_range error) {
-      elog(DEBUG3, "Row %ld not found for transaction %d", row_number, xact);
-      return false;
-    }
-  } else {
-    AttrNumber stored;
-    if (row_number >= row_metadata.size( )) {
-      return false;
-    }
-    try {
-      for (AttrNumber column_number : needed_columns) {
-        stored = column_number;
-        columns.push_back(rows[ column_number ][ row_number ]);
-      }
-    } catch (std::out_of_range error) {
-      ereport(ERROR, errcode(ERRCODE_INTERNAL_ERROR),
-              errmsg("Unable to retrieve column %d of row %ld", stored,
-                     row_number));
-    }
+
+  if (row_number >= row_metadata.size( )) {
+    return false;
   }
 
+  for (size_t iterator = 0; iterator < needed_columns.size( ); iterator++) {
+    AttrNumber column_number = needed_columns[ iterator ];
+    columns.push_back(rows[ column_number ][ row_number ]);
+  }
+
+  // debug_row(row_number);
   copy_columns_to_slot(columns, slot, needed_columns);
+  slot->tts_tid = item_pointer;
 
   return true;
 }
 
 bool Table::next_value(MemoryScanDesc *scan, TupleTableSlot *slot) {
+  DEBUG( );
   Columns columns;
   bool valid = false;
 
   do {
-    /* If we are in the local changes part of the scan. */
-    if (scan->in_local_changes) {
-      TransactionInsertList list;
-      try {
-        list = transaction_inserts[ GetCurrentTransactionId( ) ];
-      } catch (std::out_of_range error) {
-        /* No local changes for this transaction, so we are complete and can
-         * return false. */
-        return false;
-      }
-
-      /* If we are at the end of the local changes, we can return false as well.
-       */
-      if (scan->cursor >= list.size( )) {
-        return false;
-      }
-
-      TransactionInsert row = list[ scan->cursor ];
-
-      if (row.xmin <= GetCurrentTransactionId( ) &&
-          (row.xmax == 0 || row.xmax < GetCurrentTransactionId( ))) {
-        columns = row.columns;
-        valid   = true;
-      } else {
-        scan->cursor++;
-      }
+    if (scan->cursor >= row_metadata.size( )) {
+      return false;
     } else {
-      /* Otherwise we are in a normal scan. */
+      /* Check to see if the next row is visible. */
+      if (row_metadata[ scan->cursor ].xmin <= GetCurrentTransactionId( ) &&
+          (row_metadata[ scan->cursor ].xmax == 0 ||
+           row_metadata[ scan->cursor ].xmax >= GetCurrentTransactionId( )) &&
+          !row_deleted_in_transaction(scan->cursor,
+                                      GetCurrentTransactionId( ))) {
+        Columns cols;
 
-      /* If we are at the end of the normal scan, check for local changes
-       * instead. */
-      if (scan->cursor >= row_metadata.size( )) {
-        scan->cursor           = -1;
-        scan->in_local_changes = true;
-      } else {
-        /* Check to see if the next row is visible. */
-        if (row_metadata[ scan->cursor ].xmin <= GetCurrentTransactionId( ) &&
-            (row_metadata[ scan->cursor ].xmax == 0 ||
-             row_metadata[ scan->cursor ].xmax > GetCurrentTransactionId( )) &&
-            !row_deleted_in_transaction(scan->cursor,
-                                        GetCurrentTransactionId( ))) {
-          Columns cols;
-          for (size_t column_number = 0;
-               column_number < column_definitions.size( ); column_number++) {
-            cols.push_back(rows[ column_number ][ scan->cursor ]);
-          }
-          columns = cols;
-          valid   = true;
+        for (size_t column_number = 0;
+             column_number < column_definitions.size( ); column_number++) {
+          cols.push_back(rows[ column_number ][ scan->cursor ]);
         }
+        columns = cols;
+        valid   = true;
       }
     }
 
@@ -376,8 +317,7 @@ bool Table::next_value(MemoryScanDesc *scan, TupleTableSlot *slot) {
 
   copy_columns_to_slot(columns, slot, scan->needed_columns);
 
-  slot->tts_tid = row_number_to_item_pointer(
-      scan->cursor - 1, scan->in_local_changes ? (1 << 15) : 0);
+  slot->tts_tid = row_number_to_item_pointer(scan->cursor - 1);
 
   return true;
 }
@@ -417,9 +357,7 @@ size_t Table::transaction_count( ) {
 
 void Table::apply_transaction_changes_commit(TransactionId xact) {
   TransactionInsertList insert_list;
-  TransactionDeleteList delete_list;
   bool handle_inserts = false;
-  bool handle_deletes = false;
 
   try {
     insert_list    = transaction_inserts[ xact ];
@@ -428,29 +366,16 @@ void Table::apply_transaction_changes_commit(TransactionId xact) {
     elog(DEBUG3, "No insertions to commit");
   }
 
-  if (handle_inserts) {
+  if (handle_inserts && insert_list.size( )) {
     for (size_t change_row = 0; change_row < insert_list.size( );
          change_row++) {
-      TransactionInsert change = insert_list[ change_row ];
-      if (change.xmax != xact) {
-        RowMetadata metadata;
-        metadata.xmin = change.xmin;
-        metadata.xmax = change.xmax;
-
-        row_metadata.push_back(metadata);
-        for (size_t column_number = 0; column_number < change.columns.size( );
-             column_number++) {
-          Column *column  = new Column;
-          column->by_val  = change.columns[ column_number ]->by_val;
-          column->is_null = change.columns[ column_number ]->is_null;
-          column->length  = change.columns[ column_number ]->length;
-          column->value   = change.columns[ column_number ]->value;
-
-          this->rows[ column_number ].push_back(column);
-        }
-      }
+      size_t row_number               = insert_list[ change_row ];
+      row_metadata[ row_number ].xmax = 0;
     }
   }
+
+  TransactionDeleteList delete_list;
+  bool handle_deletes = false;
 
   try {
     delete_list    = transaction_deletes[ xact ];
@@ -471,6 +396,30 @@ void Table::apply_transaction_changes_commit(TransactionId xact) {
 }
 
 void Table::apply_transaction_changes_rollback(TransactionId xact) {
+  TransactionInsertList insert_list;
+  bool handle_inserts = false;
+
+  try {
+    insert_list    = transaction_inserts[ xact ];
+    handle_inserts = true;
+  } catch (std::out_of_range error) {
+    elog(DEBUG3, "No insertions to commit");
+  }
+
+  if (handle_inserts && insert_list.size( )) {
+    for (long change_row = insert_list.size( ) - 1; change_row >= 0;
+         change_row--) {
+      size_t row_number = insert_list[ change_row ];
+      row_metadata.erase(row_metadata.begin( ) + row_number);
+
+      for (size_t column_number = 0; column_number < column_definitions.size( );
+           column_number++) {
+        rows[ column_number ].erase(rows[ column_number ].begin( ) +
+                                    row_number);
+      }
+    }
+  }
+
   delete_changes_for_transaction(xact);
 }
 
@@ -488,9 +437,11 @@ void Table::delete_changes_for_transaction(TransactionId xact) {
 
 void Table::copy_columns_to_slot(Columns columns, TupleTableSlot *slot,
                                  std::vector<AttrNumber> attributes) {
-  ExecClearTuple(slot);
+  DEBUG( );
+  // ExecClearTuple(slot);
 
   AttrNumber storage_cursor = 0;
+
   for (AttrNumber attribute : attributes) {
     Column *column = columns[ attribute ];
 
@@ -508,10 +459,11 @@ void Table::copy_columns_to_slot(Columns columns, TupleTableSlot *slot,
 
     storage_cursor++;
   }
+  slot->tts_nvalid = storage_cursor;
 
-  if (TTS_EMPTY(slot)) {
-    ExecStoreVirtualTuple(slot);
-  }
+  // if (TTS_EMPTY(slot)) {
+  ExecStoreVirtualTuple(slot);
+  //}
 }
 
 Column::~Column( ) {

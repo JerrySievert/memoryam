@@ -1,0 +1,26 @@
+CREATE TEMPORARY TABLE t1 (i INT, t TEXT) USING memoryam;
+INSERT INTO t1 VALUES (1, 'hello');
+INSERT INTO t1 VALUES (2, 'world');
+SELECT * FROM t1;
+ i |   t   
+---+-------
+ 1 | hello
+ 2 | world
+(2 rows)
+
+UPDATE t1 SET t = 'foo' WHERE i = 2;
+SELECT * FROM t1;
+ i |   t   
+---+-------
+ 1 | hello
+ 2 | foo
+(2 rows)
+
+UPDATE t1 SET t = 'bar', i = 3 WHERE i = 1;
+SELECT * FROM t1;
+ i |  t  
+---+-----
+ 2 | foo
+ 3 | bar
+(2 rows)
+

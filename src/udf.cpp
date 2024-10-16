@@ -52,13 +52,6 @@ Datum memoryam_relation_details(PG_FUNCTION_ARGS) {
     funcctx->user_fctx = table;
     funcctx->max_calls = table->row_metadata.size( );
 
-    try {
-      funcctx->max_calls +=
-          table->transaction_inserts[ GetCurrentTransactionId( ) ].size( );
-    } catch (std::out_of_range error) {
-      // We can ignore this.
-    }
-
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE) {
       ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                       errmsg("function returning record called in context "
@@ -81,14 +74,6 @@ Datum memoryam_relation_details(PG_FUNCTION_ARGS) {
 
   if (call_cntr < max_calls) {
     Datum result;
-    bool in_transaction = false;
-
-    /* If we have surpassed the main row metadata, then we are into the
-     * transaction rows. */
-    if (call_cntr >= table->row_metadata.size( )) {
-      call_cntr      = call_cntr - table->row_metadata.size( );
-      in_transaction = true;
-    }
 
     /* We are returning 5 columns: row number, minimum transaction, maximum
      * transaction, whether considered deleted, and whether part of the
@@ -98,34 +83,18 @@ Datum memoryam_relation_details(PG_FUNCTION_ARGS) {
 
     get_call_result_type(fcinfo, NULL, &tupdesc);
 
-    if (in_transaction) {
-      bool is_deleted_in_transaction =
-          table->transaction_inserts[ GetCurrentTransactionId( ) ][ call_cntr ]
-                  .xmax != 0 &&
-          table->transaction_inserts[ GetCurrentTransactionId( ) ][ call_cntr ]
-                  .xmax <= GetCurrentTransactionId( );
-
-      values[ 0 ] = Int64GetDatum(call_cntr);
-      values[ 1 ] = Int32GetDatum(
-          table->transaction_inserts[ GetCurrentTransactionId( ) ][ call_cntr ]
-              .xmin);
-      values[ 2 ] = Int32GetDatum(
-          table->transaction_inserts[ GetCurrentTransactionId( ) ][ call_cntr ]
-              .xmax);
-      values[ 3 ] = BoolGetDatum(is_deleted_in_transaction);
-      values[ 4 ] = BoolGetDatum(true);
-    } else {
-      bool is_deleted =
-          table->row_metadata[ call_cntr ].xmax != 0 &&
-          table->row_metadata[ call_cntr ].xmax <= GetCurrentTransactionId( );
-      values[ 0 ] = Int64GetDatum(call_cntr);
-      values[ 1 ] = Int32GetDatum(table->row_metadata[ call_cntr ].xmin);
-      values[ 2 ] = Int32GetDatum(table->row_metadata[ call_cntr ].xmax);
-      values[ 3 ] = BoolGetDatum(is_deleted ||
-                                 table->row_deleted_in_transaction(
-                                     call_cntr, GetCurrentTransactionId( )));
-      values[ 4 ] = BoolGetDatum(false);
-    }
+    bool is_deleted =
+        (table->row_metadata[ call_cntr ].xmax != 0 &&
+         table->row_metadata[ call_cntr ].xmax <= GetCurrentTransactionId( )) ||
+        table->row_deleted_in_transaction(call_cntr,
+                                          GetCurrentTransactionId( ));
+    values[ 0 ] = Int64GetDatum(call_cntr);
+    values[ 1 ] = Int32GetDatum(table->row_metadata[ call_cntr ].xmin);
+    values[ 2 ] = Int32GetDatum(table->row_metadata[ call_cntr ].xmax);
+    values[ 3 ] =
+        BoolGetDatum(is_deleted || table->row_deleted_in_transaction(
+                                       call_cntr, GetCurrentTransactionId( )));
+    values[ 4 ] = BoolGetDatum(false);
 
     HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
     result          = HeapTupleGetDatum(tuple);

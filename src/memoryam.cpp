@@ -13,6 +13,7 @@ extern "C" {
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "nodes/parsenodes.h"
+#include "optimizer/plancat.h"
 #include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/memutils.h"
@@ -24,6 +25,7 @@ extern "C" {
 #include "store.hpp"
 
 Database database;
+MemoryContext read_context = nullptr;
 
 static Datum *detoast_values(TupleDesc tupleDesc, Datum *orig_values,
                              bool *isnull) {
@@ -104,6 +106,7 @@ static TableScanDesc memoryam_begin_scan(Relation relation, Snapshot snapshot,
                                          ParallelTableScanDesc parallel_scan,
                                          uint32 flags) {
 
+  DEBUG( );
   MemoryScanDesc *scan = (MemoryScanDesc *)palloc0(sizeof(MemoryScanDesc));
 
   scan->rs_base.rs_rd       = relation;
@@ -113,8 +116,7 @@ static TableScanDesc memoryam_begin_scan(Relation relation, Snapshot snapshot,
   scan->rs_base.rs_flags    = flags;
   scan->rs_base.rs_parallel = parallel_scan;
 
-  scan->cursor           = 0;
-  scan->in_local_changes = false;
+  scan->cursor = 0;
 
   /* Set up the columns needed for the scan. */
   for (AttrNumber scan_key = 0; scan_key < relation->rd_att->natts;
@@ -125,7 +127,10 @@ static TableScanDesc memoryam_begin_scan(Relation relation, Snapshot snapshot,
   return (TableScanDesc)scan;
 }
 
-static void memoryam_end_scan(TableScanDesc scan) { pfree(scan); }
+static void memoryam_end_scan(TableScanDesc scan) {
+  DEBUG( );
+  pfree(scan);
+}
 
 static void memoryam_rescan(TableScanDesc scan, struct ScanKeyData *key,
                             bool set_params, bool allow_strat, bool allow_sync,
@@ -135,6 +140,7 @@ static void memoryam_rescan(TableScanDesc scan, struct ScanKeyData *key,
 
 static bool memoryam_getnextslot(TableScanDesc scan, ScanDirection direction,
                                  TupleTableSlot *slot) {
+  DEBUG( );
   MemoryScanDesc *memory_scan = (MemoryScanDesc *)scan;
 
   Table *table = database.retrieve_table(memory_scan->rs_base.rs_rd);
@@ -155,14 +161,9 @@ static bool memoryam_fetch_row_version(Relation relation,
             errmsg("unable to find pointer for id %d", relation->rd_id));
   }
 
-  bool in_transaction_changes = (item_pointer->ip_posid & (1 << 15));
-
   size_t row_number = item_pointer_to_row_number(*item_pointer);
-  elog(NOTICE, "row_number: %ld, in_transaction_changes: %s", row_number,
-       in_transaction_changes ? "true" : "false");
 
   if (!table->row_visible_in_snapshot(*item_pointer, snapshot)) {
-    elog(NOTICE, "row not visible in snapshot");
     return false;
   }
 
@@ -170,30 +171,31 @@ static bool memoryam_fetch_row_version(Relation relation,
   Bitmapset *attr_needed = bms_add_range(NULL, 0, natts - 1);
   TransactionId xact     = snapshot->xmax;
   if (xact == 0) {
-    elog(NOTICE, "xact was 0, setting to %d", GetCurrentTransactionId( ));
     xact = GetCurrentTransactionId( );
   }
 
+  if (read_context == nullptr) {
+    read_context = AllocSetContextCreate(
+        TopMemoryContext, "MemoryAM Read Storage", ALLOCSET_DEFAULT_MINSIZE,
+        ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
+  }
+
+  MemoryContext old_context = MemoryContextSwitchTo(read_context);
   std::vector<AttrNumber> needed_columns =
       needed_column_list(slot->tts_tupleDescriptor, attr_needed);
+
   bool ret = table->read_row(*item_pointer, xact, slot, needed_columns);
   if (!ret) {
-    elog(NOTICE, "returning false");
+    MemoryContextSwitchTo(old_context);
     return false;
   }
-  //  ColumnarReadRowByRowNumber(*readState, rowNumber,
-  //							   slot->tts_values,
-  // slot->tts_isnull); 	MemoryContextSwitchTo(old_context);
-  slot->tts_tableOid = RelationGetRelid(relation);
-	slot->tts_tid = *item_pointer;
-	elog(NOTICE, "column 0 value: %d", DatumGetInt32(slot->tts_values[0]));
-	in_transaction_changes = (slot->tts_tid.ip_posid & (1 << 15));
-	row_number = item_pointer_to_row_number(slot->tts_tid);
-  elog(NOTICE, "fetch_row return row_number: %ld, in_transaction_changes: %s",
-       row_number, in_transaction_changes ? "true" : "false");
 
-	if (TTS_EMPTY(slot))
-		ExecStoreVirtualTuple(slot);
+  slot->tts_tableOid = RelationGetRelid(relation);
+
+  // if (TTS_EMPTY(slot))
+  ExecStoreVirtualTuple(slot);
+
+  MemoryContextSwitchTo(old_context);
 
   return true;
 }
@@ -211,9 +213,13 @@ static void memoryam_estimate_rel_size(Relation rel, int32 *attr_widths,
   *pages      = 4;
   *tuples     = 3;
   *allvisfrac = 1.0;
+  get_rel_data_width(rel, attr_widths);
 }
 
-static bool memoryam_relation_needs_toast_table(Relation rel) { return false; }
+static bool memoryam_relation_needs_toast_table(Relation rel) {
+  DEBUG( );
+  return false;
+}
 
 /* Storage related functions */
 static void memoryam_tuple_insert(Relation rel, TupleTableSlot *slot,
@@ -238,11 +244,8 @@ static void memoryam_tuple_insert(Relation rel, TupleTableSlot *slot,
   slot->tts_tid = tid;
 
   slot->tts_tableOid = RelationGetRelid(rel);
-  size_t row_number = item_pointer_to_row_number(tid);
-  bool in_transaction_changes = (tid.ip_posid & (1 << 15));
-  elog(NOTICE, "insert return row_number: %ld, in_transaction_changes: %s",
-       row_number, in_transaction_changes ? "true" : "false");
-  elog(NOTICE, "column 0 value: %d", DatumGetInt32(slot->tts_values[0]));
+  size_t row_number  = item_pointer_to_row_number(tid);
+  ExecStoreVirtualTuple(slot);
 }
 
 static void memoryam_tuple_insert_speculative(
@@ -274,6 +277,7 @@ static TM_Result memoryam_tuple_delete(Relation rel, ItemPointer tip,
                                        Snapshot crosscheck, bool wait,
                                        TM_FailureData *tmfd,
                                        bool changingPart) {
+  DEBUG( );
   Table *table = database.retrieve_table(rel);
 
   if (table == nullptr) {
@@ -298,38 +302,19 @@ static TM_Result memoryam_tuple_update(Relation relation, ItemPointer tip,
             errmsg("unable to find pointer for id %d", relation->rd_id));
   }
 
+  size_t row_number = item_pointer_to_row_number(*tip);
+
   TM_Result deletion_result = table->delete_row(relation, *tip);
   if (deletion_result == TM_Deleted) {
     return TM_Deleted;
   }
 
- 	memoryam_tuple_insert(relation, slot, cid, 0, NULL);
-#if 0
-  Datum *values;
+  memoryam_tuple_insert(relation, slot, cid, 0, NULL);
 
-  slot_getallattrs(slot);
-  values = detoast_values(slot->tts_tupleDescriptor, slot->tts_values,
-                          slot->tts_isnull);
-
-  ItemPointerData tid = table->insert_row(rel, values, slot->tts_isnull);
-  slot->tts_tid       = tid;
-
-  slot->tts_tableOid          = RelationGetRelid(rel);
-  bool in_transaction_changes = (tid.ip_posid & (1 << 15));
-
-  size_t row_number = item_pointer_to_row_number(tid);
-  elog(NOTICE, "update return row_number: %ld, in_transaction_changes: %s",
-       row_number, in_transaction_changes ? "true" : "false");
-#endif
   *update_indexes = TU_All;
-  elog(NOTICE, "column 0 value: %d", DatumGetInt32(slot->tts_values[0]));
-  size_t row_number = item_pointer_to_row_number(slot->tts_tid);
-  bool in_transaction_changes = (slot->tts_tid.ip_posid & (1 << 15));
+  ExecStoreVirtualTuple(slot);
 
-  elog(NOTICE, "update return row_number: %ld, in_transaction_changes: %s",
-       row_number, in_transaction_changes ? "true" : "false");
-
-  return TM_Ok; // TM_Updated;
+  return TM_Ok;
 }
 
 static void memoryam_finish_bulk_insert(Relation rel, int options) {
@@ -354,11 +339,8 @@ static TM_Result memoryam_tuple_lock(Relation relation,
   bool in_transaction_changes = (item_pointer->ip_posid & (1 << 15));
 
   size_t row_number = item_pointer_to_row_number(*item_pointer);
-  elog(NOTICE, "row_number: %ld, in_transaction_changes: %s", row_number,
-       in_transaction_changes ? "true" : "false");
 
   if (!table->row_visible_in_snapshot(*item_pointer, snapshot)) {
-    elog(NOTICE, "row not visible in snapshot");
     return TM_Deleted;
   }
 
@@ -366,18 +348,23 @@ static TM_Result memoryam_tuple_lock(Relation relation,
   Bitmapset *attr_needed = bms_add_range(NULL, 0, natts - 1);
   TransactionId xact     = snapshot->xmax;
   if (xact == 0) {
-    elog(NOTICE, "xact was 0, setting to %d", GetCurrentTransactionId( ));
     xact = GetCurrentTransactionId( );
   }
+  if (read_context == nullptr) {
+    read_context = AllocSetContextCreate(
+        TopMemoryContext, "MemoryAM Read Storage", ALLOCSET_DEFAULT_MINSIZE,
+        ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
+  }
 
+  MemoryContext old_context = MemoryContextSwitchTo(read_context);
   std::vector<AttrNumber> needed_columns =
       needed_column_list(slot->tts_tupleDescriptor, attr_needed);
   bool ret = table->read_row(*item_pointer, xact, slot, needed_columns);
 
   slot->tts_tableOid = RelationGetRelid(relation);
-  slot->tts_tid = *item_pointer;
+  slot->tts_tid      = *item_pointer;
   ExecStoreVirtualTuple(slot);
-
+  MemoryContextSwitchTo(old_context);
   return TM_Ok;
 }
 
@@ -421,10 +408,10 @@ const TableAmRoutine memoryam_methods = {
 
 static ExecutorEnd_hook_type prev_ExecutorEnd        = nullptr;
 static ExecutorEnd_hook_type prev_ExecutorFinish     = nullptr;
-static ProcessUtility_hook_type prev_ProcessUtility  = nullptr;
 static object_access_hook_type prev_ObjectAccessHook = nullptr;
 
 static void memoryam_ExecutorEnd(QueryDesc *queryDesc) {
+  DEBUG( );
   if (prev_ExecutorEnd) {
     prev_ExecutorEnd(queryDesc);
   } else {
@@ -433,25 +420,11 @@ static void memoryam_ExecutorEnd(QueryDesc *queryDesc) {
 }
 
 static void memoryam_ExecutorFinish(QueryDesc *queryDesc) {
+  DEBUG( );
   if (prev_ExecutorFinish) {
     prev_ExecutorFinish(queryDesc);
   } else {
     standard_ExecutorFinish(queryDesc);
-  }
-}
-
-static void memoryam_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
-                                    bool readOnlyTree,
-                                    ProcessUtilityContext context,
-                                    ParamListInfo params,
-                                    QueryEnvironment *queryEnv,
-                                    DestReceiver *dest, QueryCompletion *qc) {
-  if (prev_ProcessUtility) {
-    prev_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
-                        queryEnv, dest, qc);
-  } else {
-    standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
-                            queryEnv, dest, qc);
   }
 }
 
@@ -486,6 +459,7 @@ static void memoryam_subxact_callback(SubXactEvent event,
 }
 
 static void memoryam_xact_callback(XactEvent event, void *arg) {
+  DEBUG( );
   MemoryContext old_context = MemoryContextSwitchTo(database.memory_context);
 
   switch (event) {
@@ -515,6 +489,7 @@ static void memoryam_xact_callback(XactEvent event, void *arg) {
 
 static void memoryam_object_access_hook(ObjectAccessType access, Oid classId,
                                         Oid objectId, int subId, void *arg) {
+  DEBUG( );
   if (prev_ObjectAccessHook) {
     prev_ObjectAccessHook(access, classId, objectId, subId, arg);
   }
@@ -546,8 +521,6 @@ void _PG_init(void) {
   ExecutorEnd_hook      = memoryam_ExecutorEnd;
   prev_ExecutorFinish   = ExecutorFinish_hook;
   ExecutorFinish_hook   = memoryam_ExecutorFinish;
-  prev_ProcessUtility   = ProcessUtility_hook;
-  ProcessUtility_hook   = memoryam_ProcessUtility;
   prev_ObjectAccessHook = object_access_hook;
   object_access_hook    = memoryam_object_access_hook;
 
