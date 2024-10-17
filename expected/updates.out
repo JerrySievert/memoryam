@@ -24,3 +24,4 @@ SELECT * FROM t1;
  3 | bar
 (2 rows)
 
+DROP TABLE t1;
