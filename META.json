@@ -1,0 +1,32 @@
+{
+  "name": "memoryam",
+  "abstract": "In-memory TableAM implementation",
+  "description": "This is an in-memory temporary table implementation for PostgreSQL.",
+  "version": "0.0.1",
+  "maintainer": ["Jerry Sievert <code@legitimatesounding.com>"],
+  "license": "postgresql",
+  "provides": {
+    "memoryam": {
+      "abstract": "In-memory TableAM implementation",
+      "file": "memoryam--0.0.1.sql",
+      "docfile": "README.md",
+      "version": "0.0.1"
+    }
+  },
+  "resources": {
+    "bugtracker": {
+      "web": "https://github.com/JerrySievert/memoryam/issues/"
+    },
+    "repository": {
+      "url": "git://github.com/JerrySievert/memoryam.git",
+      "web": "https://github.com/JerrySievert/memoryam/",
+      "type": "git"
+    }
+  },
+  "generated_by": "Jerry Sievert",
+  "meta-spec": {
+    "version": "1.0.0",
+    "url": "https://pgxn.org/meta/spec.txt"
+  },
+  "tags": ["tableam", "memory", "temporary"]
+}
