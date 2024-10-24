@@ -2,3 +2,7 @@ src/*.o
 results
 .clangd
 memoryam.dylib
+memoryam.so
+regression*
+docs/html
+docs/latex

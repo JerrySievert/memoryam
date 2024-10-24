@@ -10,8 +10,7 @@ CREATE OR REPLACE FUNCTION memoryam_relation_details(
   OUT row_number bigint,
   OUT xmin integer,
   OUT xmax integer,
-  OUT is_deleted bool,
-  OUT part_of_xact bool
+  OUT is_deleted bool
 ) RETURNS SETOF record
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'memoryam_relation_details';

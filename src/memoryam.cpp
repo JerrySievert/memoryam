@@ -1,3 +1,8 @@
+/**
+ * We use extern here because as a c++ extension, we still want the
+ * PostgreSQL functions to be accessible in our namespace.  We do this
+ * again when we need to export symbols directly to PostgreSQL as well.
+ */
 extern "C" {
 #include "postgres.h"
 
@@ -12,16 +17,13 @@ extern "C" {
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
-#include "nodes/parsenodes.h"
 #include "optimizer/plancat.h"
 #include "storage/lmgr.h"
-#include "tcop/utility.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/snapmgr.h"
 }
 
-#include "memoryam.hpp"
 #include "store.hpp"
 
 Database database;
@@ -72,41 +74,64 @@ static std::vector<AttrNumber> needed_column_list(TupleDesc tupdesc,
   return column_list;
 }
 
+/**
+ * @brief Entry point for creating a new table
+ *
+ * Here a new table is created and added to the #Database
+ * instance.  We only support temporary tables, so our setup
+ * is very simple and requires no locks.
+ *
+ * @param relation #Relation to be acted on
+ * @param new relation file locator #RelFileLocator
+ * @param persistence flag on how to behave
+ * @param pointer to a xact #TransactionId to freeze at
+ * @param minmulti #MultiXactId minimum and maximum transaction id's
+ */
 static void memoryam_relation_set_new_filelocator(
-    Relation rel, const RelFileLocator *newrlocator, char persistence,
-    TransactionId *freezeXid, MultiXactId *minmulti) {
+    Relation relation, const RelFileLocator *newrlocator, char persistence,
+    TransactionId *freeze_xid, MultiXactId *minmulti) {
+  // we only operate on temporary tables, so error out on any
+  // creation that is not temporary
   if (persistence != RELPERSISTENCE_TEMP) {
     ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                     errmsg("Only temporary tables are currently supported")));
   }
 
-  /*
-   * If existing and new relfilenode are different, that means the existing
-   * storage was dropped and we also need to clean up the metadata and
-   * state. If they are equal, this is a new relation object and we don't
-   * need to clean anything.
-   */
-  if (rel->rd_locator.relNumber != newrlocator->relNumber) {
-    database.drop_table(rel);
+  // if existing and new relfilenode are different, that means the existing
+  // storage was dropped and we also need to clean up the metadata and
+  // state. If they are equal, this is a new relation object and we don't
+  // need to clean anything.
+  if (relation->rd_locator.relNumber != newrlocator->relNumber) {
+    database.drop_table(relation);
   }
 
-  *freezeXid = RecentXmin;
-  *minmulti  = GetOldestMultiXactId( );
+  // most recent minimum transaction id is a-ok
+  *freeze_xid = RecentXmin;
+  // as is the oldest multi transaction id
+  *minmulti = GetOldestMultiXactId( );
 
-  database.create_table(rel);
+  // again, in our case no need for locks, we can just create it
+  database.create_table(relation);
 }
 
+/**
+ * @brief Determines what kind of TupleTableSlotOps to use, we just
+ * return `TTSOpsVirtual`
+ */
 static const TupleTableSlotOps *memoryam_slot_callbacks(Relation relation) {
   return &TTSOpsVirtual;
 }
 
-/* Scan related functions */
+/**
+ * @brief Begins a memoryam sequential scan, setting up the required
+ * #MemoryScanDesc which stores the current states of the scan.
+ *
+ * Starts a scan,
+ */
 static TableScanDesc memoryam_begin_scan(Relation relation, Snapshot snapshot,
                                          int nkeys, struct ScanKeyData *key,
                                          ParallelTableScanDesc parallel_scan,
                                          uint32 flags) {
-
-  DEBUG( );
   MemoryScanDesc *scan = (MemoryScanDesc *)palloc0(sizeof(MemoryScanDesc));
 
   scan->rs_base.rs_rd       = relation;
@@ -127,20 +152,26 @@ static TableScanDesc memoryam_begin_scan(Relation relation, Snapshot snapshot,
   return (TableScanDesc)scan;
 }
 
-static void memoryam_end_scan(TableScanDesc scan) {
-  DEBUG( );
-  pfree(scan);
-}
+/**
+ * @brief Ends a memory scan, freeing any allocated memory
+ */
+static void memoryam_end_scan(TableScanDesc scan) { pfree(scan); }
 
 static void memoryam_rescan(TableScanDesc scan, struct ScanKeyData *key,
                             bool set_params, bool allow_strat, bool allow_sync,
                             bool allow_pagemode) {
-  DEBUG( );
+  // we do nothing here currently
 }
 
+/**
+ * @brief Reads the next value visible in the sequential scan, returning
+ * `true` if there is a row, and `false` if no more exist
+ *
+ * Attempts to read the next value in the #MemoryScanDesc,
+ * @returns whether a row can be read as a #bool value
+ */
 static bool memoryam_getnextslot(TableScanDesc scan, ScanDirection direction,
                                  TupleTableSlot *slot) {
-  DEBUG( );
   MemoryScanDesc *memory_scan = (MemoryScanDesc *)scan;
 
   Table *table = database.retrieve_table(memory_scan->rs_base.rs_rd);
@@ -149,19 +180,23 @@ static bool memoryam_getnextslot(TableScanDesc scan, ScanDirection direction,
   return found;
 }
 
+/**
+ * @brief Fetch a version of a row by its #ItemPointer, making sure that
+ * it is visible
+ *
+ * If a row is found to match the #ItemPointer and #Snapshot, it is
+ * loaded into the #TupleTableSlot provided, and `true` is returned.
+ * @returns whether the row has been fetched as a #bool
+ */
 static bool memoryam_fetch_row_version(Relation relation,
                                        ItemPointer item_pointer,
                                        Snapshot snapshot,
                                        TupleTableSlot *slot) {
-  DEBUG( );
-  // ereport(ERROR, (errmsg("memoryam_fetch_row_version is not implemented")));
   Table *table = database.retrieve_table(relation);
   if (table == nullptr) {
     ereport(ERROR, errcode(ERRCODE_UNDEFINED_TABLE),
             errmsg("unable to find pointer for id %d", relation->rd_id));
   }
-
-  size_t row_number = item_pointer_to_row_number(*item_pointer);
 
   if (!table->row_visible_in_snapshot(*item_pointer, snapshot)) {
     return false;
@@ -192,9 +227,6 @@ static bool memoryam_fetch_row_version(Relation relation,
 
   slot->tts_tableOid = RelationGetRelid(relation);
 
-  // if (TTS_EMPTY(slot))
-  ExecStoreVirtualTuple(slot);
-
   MemoryContextSwitchTo(old_context);
 
   return true;
@@ -202,56 +234,80 @@ static bool memoryam_fetch_row_version(Relation relation,
 
 /* Size related functions */
 static uint64 memoryam_relation_size(Relation rel, ForkNumber forkNumber) {
-  DEBUG( );
   return 4096 * BLCKSZ;
 }
 
-static void memoryam_estimate_rel_size(Relation rel, int32 *attr_widths,
+/**
+ * @brief Returns an estimation of the #Relation size
+ */
+static void memoryam_estimate_rel_size(Relation relation, int32 *attr_widths,
                                        BlockNumber *pages, double *tuples,
                                        double *allvisfrac) {
-  DEBUG( );
-  *pages      = 4;
-  *tuples     = 3;
-  *allvisfrac = 1.0;
-  get_rel_data_width(rel, attr_widths);
-}
-
-static bool memoryam_relation_needs_toast_table(Relation rel) {
-  DEBUG( );
-  return false;
-}
-
-/* Storage related functions */
-static void memoryam_tuple_insert(Relation rel, TupleTableSlot *slot,
-                                  CommandId cid, int options,
-                                  struct BulkInsertStateData *bistate) {
-  DEBUG( );
-  Table *table = database.retrieve_table(rel);
+  // find the #Table that is associated with this relation #Relation
+  Table *table = database.retrieve_table(relation);
 
   if (table == nullptr) {
     ereport(ERROR, errcode(ERRCODE_UNDEFINED_TABLE),
-            errmsg("unable to find pointer for id %d", rel->rd_id));
+            errmsg("unable to find pointer for id %d", relation->rd_id));
   }
 
-  Datum *values;
+  *pages      = 1;
+  *tuples     = table->row_metadata.size( );
+  *allvisfrac = 1.0;
+  get_rel_data_width(relation, attr_widths);
+}
 
+/**
+ * @brief Determine whether a #Relation needs toast tables
+ *
+ * @param relation #Relation
+ * @returns false as we do not use toast tables
+ */
+static bool memoryam_relation_needs_toast_table(Relation relation) {
+  return false;
+}
+
+/**
+ * @brief A call for an insertion of data into a memoryam #Table defined
+ * by a row
+ *
+ * Insert a row of data into a #Table, detoasting any values and having
+ * them allocated in the memory context of the table.  In return, we fill
+ * the #TupleTableSlot provided with the saved tuple, along with its
+ * potential #ItemPointerData as to where it might live if this transation
+ * is committed.
+ */
+static void memoryam_tuple_insert(Relation relation, TupleTableSlot *slot,
+                                  CommandId cid, int options,
+                                  struct BulkInsertStateData *bistate) {
+  // find the #Table that is associated with this relation #Relation
+  Table *table = database.retrieve_table(relation);
+
+  if (table == nullptr) {
+    ereport(ERROR, errcode(ERRCODE_UNDEFINED_TABLE),
+            errmsg("unable to find pointer for id %d", relation->rd_id));
+  }
+
+  // retrieve all of the attributes, we will use them all during insert
   slot_getallattrs(slot);
-  values = detoast_values(slot->tts_tupleDescriptor, slot->tts_values,
-                          slot->tts_isnull);
 
-  ItemPointerData tid = table->insert_row(rel, values, slot->tts_isnull);
+  // get an allocation of all of the #Datum to be a copy including those
+  // that have been toasted
+  Datum *values = detoast_values(slot->tts_tupleDescriptor, slot->tts_values,
+                                 slot->tts_isnull);
 
-  slot->tts_tid = tid;
+  // insert the row into the storage engine, which gives us #ItemPointerData
+  // that points to the internal row number
+  ItemPointerData tid = table->insert_row(relation, values, slot->tts_isnull);
 
-  slot->tts_tableOid = RelationGetRelid(rel);
-  size_t row_number  = item_pointer_to_row_number(tid);
-  ExecStoreVirtualTuple(slot);
+  // set the ItemPointerData and the table relation ID
+  slot->tts_tid      = tid;
+  slot->tts_tableOid = RelationGetRelid(relation);
 }
 
 static void memoryam_tuple_insert_speculative(
     Relation rel, TupleTableSlot *slot, CommandId cid, int options,
     struct BulkInsertStateData *bistate, uint32 specToken) {
-  DEBUG( );
   ereport(ERROR,
           (errmsg("memoryam_tuple_insert_speculative is not implemented")));
 }
@@ -260,7 +316,6 @@ static void memoryam_tuple_complete_speculative(Relation rel,
                                                 TupleTableSlot *slot,
                                                 uint32 specToken,
                                                 bool succeeded) {
-  DEBUG( );
   ereport(ERROR,
           (errmsg("memoryam_tuple_complete_speculative is not implemented")));
 }
@@ -268,33 +323,21 @@ static void memoryam_tuple_complete_speculative(Relation rel,
 static void memoryam_multi_insert(Relation rel, TupleTableSlot **slots,
                                   int nslots, CommandId cid, int options,
                                   struct BulkInsertStateData *bistate) {
-  DEBUG( );
   ereport(ERROR, (errmsg("memoryam_tuple_insert is not implemented")));
 }
 
-static TM_Result memoryam_tuple_delete(Relation rel, ItemPointer tip,
+/**
+ * @brief Deletes a row in the table
+ *
+ * When passed an #ItemPointer, deletes the row associated with it
+ * and returns the result.
+ * @returns result #TM_Result of deletion, either TM_Ok or TM_Deleted
+ */
+static TM_Result memoryam_tuple_delete(Relation relation, ItemPointer tip,
                                        CommandId cid, Snapshot snapshot,
                                        Snapshot crosscheck, bool wait,
                                        TM_FailureData *tmfd,
                                        bool changingPart) {
-  DEBUG( );
-  Table *table = database.retrieve_table(rel);
-
-  if (table == nullptr) {
-    ereport(ERROR, errcode(ERRCODE_UNDEFINED_TABLE),
-            errmsg("unable to find pointer for id %d", rel->rd_id));
-  }
-
-  return table->delete_row(rel, *tip);
-}
-
-static TM_Result memoryam_tuple_update(Relation relation, ItemPointer tip,
-                                       TupleTableSlot *slot, CommandId cid,
-                                       Snapshot snapshot, Snapshot crosscheck,
-                                       bool wait, TM_FailureData *tmfd,
-                                       LockTupleMode *lockmode,
-                                       TU_UpdateIndexes *update_indexes) {
-  DEBUG( );
   Table *table = database.retrieve_table(relation);
 
   if (table == nullptr) {
@@ -302,23 +345,43 @@ static TM_Result memoryam_tuple_update(Relation relation, ItemPointer tip,
             errmsg("unable to find pointer for id %d", relation->rd_id));
   }
 
-  size_t row_number = item_pointer_to_row_number(*tip);
+  // call the delete_row method for the table
+  return table->delete_row(*tip);
+}
 
-  TM_Result deletion_result = table->delete_row(relation, *tip);
+/**
+ * @brief Updates a tuple, deleting the old and inserting a new one
+ *
+ * @returns Result of the update as #TM_Result
+ */
+static TM_Result memoryam_tuple_update(Relation relation, ItemPointer tip,
+                                       TupleTableSlot *slot, CommandId cid,
+                                       Snapshot snapshot, Snapshot crosscheck,
+                                       bool wait, TM_FailureData *tmfd,
+                                       LockTupleMode *lockmode,
+                                       TU_UpdateIndexes *update_indexes) {
+  Table *table = database.retrieve_table(relation);
+
+  if (table == nullptr) {
+    ereport(ERROR, errcode(ERRCODE_UNDEFINED_TABLE),
+            errmsg("unable to find pointer for id %d", relation->rd_id));
+  }
+
+  TM_Result deletion_result = table->delete_row(*tip);
   if (deletion_result == TM_Deleted) {
     return TM_Deleted;
   }
 
   memoryam_tuple_insert(relation, slot, cid, 0, NULL);
 
+  // we don't really have indexes currently, but we would normally tell
+  // PostgreSQL to update any
   *update_indexes = TU_All;
-  ExecStoreVirtualTuple(slot);
 
   return TM_Ok;
 }
 
 static void memoryam_finish_bulk_insert(Relation rel, int options) {
-  DEBUG( );
   ereport(ERROR, (errmsg("memoryam_finish_bulk_insert is not implemented")));
 }
 
@@ -328,17 +391,11 @@ static TM_Result memoryam_tuple_lock(Relation relation,
                                      CommandId cid, LockTupleMode mode,
                                      LockWaitPolicy wait_policy, uint8 flags,
                                      TM_FailureData *tmfd) {
-  DEBUG( );
-  // ereport(ERROR, (errmsg("memoryam_fetch_row_version is not implemented")));
   Table *table = database.retrieve_table(relation);
   if (table == nullptr) {
     ereport(ERROR, errcode(ERRCODE_UNDEFINED_TABLE),
             errmsg("unable to find pointer for id %d", relation->rd_id));
   }
-
-  bool in_transaction_changes = (item_pointer->ip_posid & (1 << 15));
-
-  size_t row_number = item_pointer_to_row_number(*item_pointer);
 
   if (!table->row_visible_in_snapshot(*item_pointer, snapshot)) {
     return TM_Deleted;
@@ -359,19 +416,20 @@ static TM_Result memoryam_tuple_lock(Relation relation,
   MemoryContext old_context = MemoryContextSwitchTo(read_context);
   std::vector<AttrNumber> needed_columns =
       needed_column_list(slot->tts_tupleDescriptor, attr_needed);
-  bool ret = table->read_row(*item_pointer, xact, slot, needed_columns);
+
+  table->read_row(*item_pointer, xact, slot, needed_columns);
 
   slot->tts_tableOid = RelationGetRelid(relation);
   slot->tts_tid      = *item_pointer;
-  ExecStoreVirtualTuple(slot);
+
   MemoryContextSwitchTo(old_context);
+
   return TM_Ok;
 }
 
 static void memoryam_vacuum_rel(Relation rel, VacuumParams *params,
                                 BufferAccessStrategy bstrategy) {
 
-  DEBUG( );
   ereport(INFO, (errmsg("memoryam_vacuum_rel is not implemented")));
 }
 
@@ -411,7 +469,6 @@ static ExecutorEnd_hook_type prev_ExecutorFinish     = nullptr;
 static object_access_hook_type prev_ObjectAccessHook = nullptr;
 
 static void memoryam_ExecutorEnd(QueryDesc *queryDesc) {
-  DEBUG( );
   if (prev_ExecutorEnd) {
     prev_ExecutorEnd(queryDesc);
   } else {
@@ -420,7 +477,6 @@ static void memoryam_ExecutorEnd(QueryDesc *queryDesc) {
 }
 
 static void memoryam_ExecutorFinish(QueryDesc *queryDesc) {
-  DEBUG( );
   if (prev_ExecutorFinish) {
     prev_ExecutorFinish(queryDesc);
   } else {
@@ -431,42 +487,18 @@ static void memoryam_ExecutorFinish(QueryDesc *queryDesc) {
 static void memoryam_subxact_callback(SubXactEvent event,
                                       SubTransactionId mySubid,
                                       SubTransactionId parentSubid, void *arg) {
-  elog(NOTICE,
-       "memoryam_subxact_callback: %d (%d / %d), transaction id %d / %d", event,
-       mySubid, parentSubid, GetCurrentTransactionId( ),
-       GetCurrentSubTransactionId( ));
-#if 0
-  switch (event) {
-  case SUBXACT_EVENT_START_SUB:
-  case SUBXACT_EVENT_COMMIT_SUB: {
-    /* nothing to do */
-    break;
-  }
-
-  case SUBXACT_EVENT_ABORT_SUB: {
-    DiscardWriteStateForAllRels(mySubid, parentSubid);
-    CleanupReadStateCache(mySubid);
-    break;
-  }
-
-  case SUBXACT_EVENT_PRE_COMMIT_SUB: {
-    FlushWriteStateForAllRels(mySubid, parentSubid);
-    CleanupReadStateCache(mySubid);
-    break;
-  }
-  }
-#endif
+  ereport(ERROR, (errmsg("memoryam_subxact_callback is not implemented")));
 }
 
+/**
+ * @brief Callback for when a transaction is to be dealt with
+ */
 static void memoryam_xact_callback(XactEvent event, void *arg) {
-  DEBUG( );
-  MemoryContext old_context = MemoryContextSwitchTo(database.memory_context);
-
   switch (event) {
   case XACT_EVENT_COMMIT:
   case XACT_EVENT_PARALLEL_COMMIT:
   case XACT_EVENT_PREPARE: {
-    /* nothing to do */
+    database.apply_transaction_changes_commit(GetCurrentTransactionId( ));
     break;
   }
 
@@ -479,22 +511,28 @@ static void memoryam_xact_callback(XactEvent event, void *arg) {
   case XACT_EVENT_PRE_COMMIT:
   case XACT_EVENT_PARALLEL_PRE_COMMIT:
   case XACT_EVENT_PRE_PREPARE: {
-    database.apply_transaction_changes_commit(GetCurrentTransactionId( ));
+    // nothing to do in this case
     break;
   }
   }
-
-  MemoryContextSwitchTo(old_context);
 }
 
+/**
+ * @brief Access hook for object access
+ *
+ * Intercepts calls to the object access hook to give us information that
+ * we might care about.  In general, the only #ObjectAccessType that we
+ * care about is `OAT_DROP`, which tells us to drop a table.  When this
+ * occurs, we tell the storage engine to drop the table.
+ */
 static void memoryam_object_access_hook(ObjectAccessType access, Oid classId,
                                         Oid objectId, int subId, void *arg) {
-  DEBUG( );
   if (prev_ObjectAccessHook) {
     prev_ObjectAccessHook(access, classId, objectId, subId, arg);
   }
 
-  /* dispatch to the proper action */
+  // We care about dropping of tables here, if this is a drop
+  // then we call the drop_table which tries to deal with it if it can
   if (access == OAT_DROP && classId == RelationRelationId &&
       !OidIsValid(subId)) {
     LockRelationOid(objectId, AccessShareLock);
@@ -517,20 +555,18 @@ Datum memoryam_tableam_handler(PG_FUNCTION_ARGS) {
 }
 
 void _PG_init(void) {
-  prev_ExecutorEnd      = ExecutorEnd_hook;
-  ExecutorEnd_hook      = memoryam_ExecutorEnd;
-  prev_ExecutorFinish   = ExecutorFinish_hook;
-  ExecutorFinish_hook   = memoryam_ExecutorFinish;
+  prev_ExecutorEnd    = ExecutorEnd_hook;
+  ExecutorEnd_hook    = memoryam_ExecutorEnd;
+  prev_ExecutorFinish = ExecutorFinish_hook;
+  ExecutorFinish_hook = memoryam_ExecutorFinish;
+
+  // set up our object access hook, we only care for OAT_DROP
   prev_ObjectAccessHook = object_access_hook;
   object_access_hook    = memoryam_object_access_hook;
 
+  // register our transaction callback
   RegisterXactCallback(memoryam_xact_callback, NULL);
   RegisterSubXactCallback(memoryam_subxact_callback, NULL);
-
-  /* Set up the working MemoryContext for data storage. */
-  database.memory_context = AllocSetContextCreate(
-      TopMemoryContext, "MemoryAM Storage", ALLOCSET_DEFAULT_MINSIZE,
-      ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
 }
 
 } // extern "C"
